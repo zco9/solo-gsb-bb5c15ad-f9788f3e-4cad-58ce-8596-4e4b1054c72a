@@ -1,0 +1,711 @@
+# 多轨录音节拍对齐 API（FastAPI + SQLite）
+
+客户端提交**参考节拍网格**（reference beat grid）与某条演奏轨的**音符起始时间**
+（note onsets）。服务端使用**带宽约束的动态时间规整（Sakoe-Chiba Band DTW）**
+在带状窗口内寻找最优对齐路径，显式处理：
+
+- **漏拍（missed beat）**：参考网格里有、演奏中缺失的拍；
+- **抢拍（early）/ 拖拍（late）**：演奏相对参考网格的连续时间偏差；
+- **插入拍（inserted beat）**：演奏中多出来、参考网格里没有的音。
+
+回溯最优路径后输出：参考拍 ↔ 演奏音的**一一对应映射**、漏拍 / 插入拍清单、
+按连续段组织的**偏差区间**及统计指标。结果持久化到 SQLite，可反复查询。
+
+创建任务时还可以提供**锚点（anchors）硬约束**：显式声明某些“参考拍 ↔ 演奏音”
+必须配对（例如人工确认的重音点、已知小节线位置）。对齐时 DTW 被拆成相邻锚点
+之间的若干独立子段分别寻优，再合并为完整路径——锚点保证被采用，段内仍允许
+漏拍、插入拍与连续偏差。
+
+对已完成的任务还可提取**复核片段（review segments）**：指定**偏差阈值**与
+**可容忍的拍间隔**，把对齐结果中的漏拍、插入音及超阈值偏差按参考拍顺序聚合成
+若干片段，返回每个片段的**拍号范围**与**问题摘要**，供人工逐段复核。
+
+多条共享**同一参考节拍网格**的演奏轨（≥3 个已完成任务）还可做**跨任务合奏
+一致性（ensemble consensus）**分析：先用各轨匹配拍偏差的中位数估计并扣除固定
+录音延迟，再按参考拍取各轨校正时间的中位数为合奏基准，列出偏离基准超过秒级
+阈值的任务；覆盖不足 3 轨的拍标记为不可判定，漏拍逐轨列出。
+
+至少 2 条共享同一参考网格的**已对齐录音**还能生成**剪辑方案（compilation
+plan）**：按参考拍划小节，只有完整匹配某小节全部拍的录音才可用于该小节，
+以该小节匹配拍平均绝对偏差为选用代价；用动态规划最小化各小节选用代价与
+相邻小节换轨代价之和，同代价时优先请求顺序靠前的任务，返回合并连续同源
+小节后的剪辑片段。
+
+## 目录结构
+
+```
+.
+├── app/
+│   ├── main.py          # FastAPI 路由
+│   ├── alignment.py     # 带宽约束 DTW 核心算法（纯标准库，含锚点分段对齐）
+│   ├── tempo.py         # 节奏曲线（tempo map）估计：中位数窗口 + 稳定区间压缩
+│   ├── review.py        # 复核片段提取：漏拍/插入音/超阈值偏差按参考拍聚合
+│   ├── ensemble.py      # 跨任务合奏一致性：逐轨延迟校正 + 逐拍中位数基准
+│   ├── comp_plan.py     # 剪辑方案：按小节平均绝对偏差 + 换轨代价的动态规划拼轨
+│   ├── schemas.py       # Pydantic 请求/响应模型
+│   ├── database.py      # SQLite 连接、建表与旧库迁移
+│   └── crud.py          # 任务读写
+├── tests/               # unittest 测试（对齐算法 18 个 + 节奏曲线 10 个
+│                        #   + 复核片段 14 个 + 合奏一致性 10 个
+│                        #   + 剪辑方案 13 个 + 接口 38 个）
+├── Dockerfile
+├── docker-compose.yml
+└── requirements.txt
+```
+
+## 一键启动（Docker Compose）
+
+```bash
+docker compose up --build
+```
+
+- 服务端口：**`8000`**（容器内 8000，映射到宿主机同端口）
+- 交互式文档（Swagger UI）：<http://localhost:8000/docs>
+- 只读文档（ReDoc）：<http://localhost:8000/redoc>
+- 健康检查：`GET http://localhost:8000/health`
+- 复核片段接口示例：
+  `GET http://localhost:8000/jobs/1/review-segments?deviation_threshold=0.05&gap_tolerance_beats=2`
+- 合奏一致性接口示例：
+  `POST http://localhost:8000/ensembles/consensus`
+  （请求体 `{"job_ids": [1, 2, 3], "deviation_threshold": 0.05}`）
+- 剪辑方案接口示例：
+  `POST http://localhost:8000/takes/comp-plan`
+  （请求体 `{"job_ids": [1, 2], "beats_per_bar": 4, "switch_cost": 0.05}`）
+- SQLite 数据文件：容器内 `/data/alignment.db`，由命名卷 `beat-data` 持久化
+
+配置（均通过环境变量，见 `docker-compose.yml`）：
+
+| 变量             | 默认值                  | 说明                           |
+| ---------------- | ----------------------- | ------------------------------ |
+| `ALIGN_DB_PATH`  | `/data/alignment.db`    | SQLite 数据库文件路径（目录自动创建） |
+
+如需改宿主机端口，编辑 `docker-compose.yml` 中 `ports` 的左侧值
+（例如 `"18000:8000"`）；数据库路径可改 `environment.ALIGN_DB_PATH` 并同步
+挂载的卷。
+
+停止：
+
+```bash
+docker compose down          # 保留数据
+docker compose down -v       # 同时删除数据库卷
+```
+
+## 本地（无 Docker）运行
+
+需要 Python 3.11：
+
+```bash
+pip install -r requirements.txt
+ALIGN_DB_PATH=./data/alignment.db uvicorn app.main:app --host 0.0.0.0 --port 8000
+```
+
+运行测试：
+
+```bash
+PYTHONPATH=. python -m unittest discover -s tests -v
+```
+
+## API 一览
+
+| 方法   | 路径                       | 说明                                   |
+| ------ | -------------------------- | -------------------------------------- |
+| POST   | `/jobs`                    | 创建对齐任务（可选 `anchors` 锚点，状态 `pending`） |
+| POST   | `/jobs/{id}/align`         | 执行（锚点约束）DTW 对齐并保存结果     |
+| GET    | `/jobs/{id}`               | 查询任务（含完整输入、锚点与结果）     |
+| GET    | `/jobs/{id}/result`        | 只查询对齐结果（含已采用锚点）         |
+| GET    | `/jobs/{id}/tempo-map`     | 从 matched_beats 导出节奏曲线（tempo events） |
+| GET    | `/jobs/{id}/review-segments` | 提取复核片段：漏拍/插入音/超阈值偏差按参考拍聚合（拍号范围 + 摘要） |
+| POST   | `/ensembles/consensus`     | 跨任务合奏一致性：逐轨固定延迟校正后按参考拍取中位数基准，列出超阈值异常任务 |
+| POST   | `/takes/comp-plan`         | 多轨剪辑方案：按小节平均绝对偏差 + 换轨代价动态规划拼轨，合并连续同源小节 |
+| GET    | `/jobs`                    | 任务列表（摘要，按创建时间倒序）       |
+| GET    | `/health`                  | 健康检查                               |
+
+`POST /jobs/{id}/align` 已完成的任务默认直接返回原结果；加 `?force=true`
+可强制重新对齐。
+
+### 请求体（`POST /jobs`）
+
+```json
+{
+  "name": "take-01",
+  "reference_beats": [0.0, 0.5, 1.0, 1.5, 2.0, 2.5],
+  "performance_onsets": [-0.02, 0.47, 1.53, 1.76, 2.04, 2.52],
+  "anchors": [
+    {"ref_index": 0, "perf_index": 0},
+    {"ref_index": 5, "perf_index": 5}
+  ],
+  "params": {
+    "band_width": 2,
+    "skip_penalty": null,
+    "insert_penalty": null,
+    "on_time_threshold": 0.03
+  }
+}
+```
+
+- `reference_beats` / `performance_onsets`：单位秒，必须**严格递增**
+  （允许略小于 0 的前摇时间，例如演奏音比第 0 拍早几十毫秒）。
+- `anchors`（可选）：锚点硬约束数组，每项 `{"ref_index", "perf_index"}`
+  为 **0 基**索引，表示“该参考拍必须与该演奏音匹配”。
+  - 两个索引都必须**严格递增**（锚点按出现顺序排列，不可重复使用某一拍）；
+  - 必须在各自序列范围内（`ref_index < len(reference_beats)`、
+    `perf_index < len(performance_onsets)`）且非负；
+  - 每个锚点必须在带宽内可达：`|ref_index − perf_index| ≤ band_width`；
+  - 相邻锚点之间、首锚点到起点、末锚点到终点的漏拍 / 插入拍数量也受带宽约束，
+    服务会对以上所有情况校验，不满足时返回 `400` 并给出具体原因
+    （越界 / 非递增 / 超出带宽不可达）。
+  - 对齐时每个相邻锚点对之间独立做一段 DTW，再按顺序合并为完整路径；
+    **漏拍 / 插入拍仍可发生在锚点之间的段内**。对齐结果的 `anchors` 字段
+    回传本次实际采用的锚点（含两侧时间、偏差与 early/on_time/late 状态）。
+- `params.band_width`：Sakoe-Chiba 带宽（拍数，默认 3）。要求
+  `|len(ref) − len(perf)| ≤ band_width`，否则创建时返回 `400`。
+  带宽越小越保守（只允许局部错位），越大越能容忍连续漏拍 / 插入拍。
+- `params.skip_penalty` / `insert_penalty`：漏 / 插一拍的代价（**秒²**）。
+  默认 `(0.5 × 参考网格中位拍间隔)²`（本例拍间隔 0.5s ⇒ 0.0625）。
+- `params.on_time_threshold`：`|偏差| ≤` 该秒数判定为 `on_time`（默认 0.03s）。
+
+偏差符号约定：`deviation = perf_time − ref_time`，负值=**抢拍 early**，
+正值=**拖拍 late**。
+
+## 示例请求（curl 完整流程）
+
+```bash
+# 1) 创建任务（带两个锚点：开头与结尾必须一一对应）
+curl -s -X POST http://localhost:8000/jobs \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "name": "take-01",
+    "reference_beats": [0.0, 0.5, 1.0, 1.5, 2.0, 2.5],
+    "performance_onsets": [-0.02, 0.47, 1.53, 1.76, 2.04, 2.52],
+    "anchors": [{"ref_index": 0, "perf_index": 0},
+                {"ref_index": 5, "perf_index": 5}],
+    "params": {"band_width": 2}
+  }'
+# => 201，记录返回的 "id"（下文以 $ID 表示）；非法锚点会返回 400
+
+# 2) 执行对齐
+curl -s -X POST http://localhost:8000/jobs/$ID/align
+
+# 3) 查询结果
+curl -s http://localhost:8000/jobs/$ID/result
+
+# 4) 导出节奏曲线（可带窗口与 BPM 范围参数）
+curl -s "http://localhost:8000/jobs/$ID/tempo-map?window_beats=5&min_bpm=40&max_bpm=300"
+
+# 5) 提取复核片段（偏差阈值 0.05s，问题相距不超过 2 拍则合并）
+curl -s "http://localhost:8000/jobs/$ID/review-segments?deviation_threshold=0.05&gap_tolerance_beats=2"
+
+# 6) 跨任务合奏一致性（至少 3 个已完成任务，秒级异常阈值 0.05s）
+curl -s -X POST http://localhost:8000/ensembles/consensus \
+  -H 'Content-Type: application/json' \
+  -d '{"job_ids": [1, 2, 3], "deviation_threshold": 0.05}'
+
+# 7) 多轨剪辑方案（至少 2 个共享同一参考网格的已完成任务）
+curl -s -X POST http://localhost:8000/takes/comp-plan \
+  -H 'Content-Type: application/json' \
+  -d '{"job_ids": [1, 2], "beats_per_bar": 3, "switch_cost": 0.05}'
+
+# 8) 列出全部任务
+curl -s http://localhost:8000/jobs
+```
+
+Python 示例：
+
+```python
+import requests
+
+BASE = "http://localhost:8000"
+
+job = requests.post(f"{BASE}/jobs", json={
+    "name": "take-01",
+    "reference_beats": [0.0, 0.5, 1.0, 1.5, 2.0, 2.5],
+    "performance_onsets": [-0.02, 0.47, 1.53, 1.76, 2.04, 2.52],
+    "params": {"band_width": 2},
+    # 可选：锚点硬约束（参考拍索引、演奏音索引，均 0 基且严格递增）
+    "anchors": [{"ref_index": 0, "perf_index": 0},
+                {"ref_index": 5, "perf_index": 5}],
+}).json()
+
+result = requests.post(f"{BASE}/jobs/{job['id']}/align").json()["result"]
+
+print("已采用锚点:", [(a["ref_index"], a["perf_index"]) for a in result["anchors"]])
+for b in result["matched_beats"]:
+    print(b["ref_index"], "->", b["perf_index"],
+          f"偏差 {b['deviation']:+.2f}s ({b['status']})")
+print("漏拍:", [b["ref_index"] for b in result["missed_beats"]])
+print("插入拍:", [b["perf_index"] for b in result["inserted_beats"]])
+```
+
+## 结果结构（节选）
+
+上例中参考拍 `1.0s`（索引 2）被漏，演奏在 `1.76s`（索引 3）插入了一个音：
+
+```json
+{
+  "parameters": { /* 实际使用的带宽与惩罚代价 */ },
+  "anchors": [
+    {"ref_index": 0, "perf_index": 0, "ref_time": 0.0, "perf_time": -0.02,
+     "deviation": -0.02, "status": "on_time"},
+    {"ref_index": 5, "perf_index": 5, "ref_time": 2.5, "perf_time": 2.52,
+     "deviation": 0.02, "status": "on_time"}
+  ],
+  "matched_beats": [
+    {"ref_index": 0, "perf_index": 0, "ref_time": 0.0,  "perf_time": -0.02, "deviation": -0.02, "status": "on_time"},
+    {"ref_index": 1, "perf_index": 1, "ref_time": 0.5,  "perf_time": 0.47,  "deviation": -0.03, "status": "early"},
+    {"ref_index": 3, "perf_index": 2, "ref_time": 1.5,  "perf_time": 1.53,  "deviation": 0.03,  "status": "late"},
+    {"ref_index": 4, "perf_index": 4, "ref_time": 2.0,  "perf_time": 2.04,  "deviation": 0.04,  "status": "late"},
+    {"ref_index": 5, "perf_index": 5, "ref_time": 2.5,  "perf_time": 2.52,  "deviation": 0.02,  "status": "on_time"}
+  ],
+  "missed_beats":   [{"ref_index": 2, "ref_time": 1.0}],
+  "inserted_beats": [{"perf_index": 3, "perf_time": 1.76}],
+  "deviation_segments": [ /* 参考索引连续的最大匹配段，含段内逐拍偏差 */ ],
+  "signed_intervals":   [ /* 段内按 抢/准/拖 归并的同向连续区间 */ ],
+  "statistics": {
+    "ref_beat_count": 6, "perf_onset_count": 6,
+    "matched_count": 5, "missed_count": 1, "inserted_count": 1,
+    "early_count": 1, "on_time_count": 2, "late_count": 2,
+    "mean_deviation": 0.008, "mean_absolute_deviation": 0.028,
+    "rms_deviation": 0.028983, "max_absolute_deviation": 0.04,
+    "total_cost": 0.1292, "normalized_cost": 0.018457
+  }
+}
+```
+
+- `anchors`：本次对齐实际采用的锚点（即创建任务时提交、并作为硬约束
+  生效的那些点），未提供锚点时为 `[]`。任务对象上另有同名 `anchors`
+  字段，保存创建时提交的锚点，便于复查输入。
+- `matched_beats`：一一对应映射，含两侧索引、时间、偏差（秒）与状态。
+- `missed_beats` / `inserted_beats`：未配对的参考拍 / 演奏音。
+- `deviation_segments`：按**参考拍索引连续**切出的最大匹配段（漏拍 /
+  插入拍造成缺口时另起一段）。段内偏差是关于参考时间的连续分段线性函数，
+  可直接用于绘制偏差曲线或做时间拉伸补偿；含段的起止时间、逐拍偏差及
+  min/max/mean。
+- `signed_intervals`：在每个连续段内再按 `early/on_time/late` 归并，得到
+  **同向连续偏差区间**（例如“第 3–4 拍连续拖拍，平均 +0.035s”）。
+- `statistics`：配对数量、抢/准/拖计数、平均偏差、平均绝对偏差、RMS、
+  最大绝对偏差、路径总代价与按路径长度归一化的代价。
+
+## 节奏曲线导出（`GET /jobs/{id}/tempo-map`）
+
+对**已完成**的任务，基于对齐结果里的 `matched_beats` 估计局部节奏（BPM），
+输出可直接用于时间拉伸 / 重映射的 tempo events（类似 DAW 中的 tempo map）。
+
+查询参数：
+
+| 参数           | 默认 | 说明                                                       |
+| -------------- | ---- | ---------------------------------------------------------- |
+| `window_beats` | `5`  | 滑动中位数窗口（拍数，取中心 ±`window_beats//2`，1–101）   |
+| `min_bpm`      | `40` | 接受的最小 BPM（必须 > 0）                                 |
+| `max_bpm`      | `300`| 接受的最大 BPM（必须 > `min_bpm`，否则 422）               |
+
+处理流程：
+
+1. 对 matched_beats 的每个**相邻匹配对**，按参考拍跨度换算原始局部 BPM：
+   `bpm = 60 × (ref_index 差) / (perf_time 差)`。正常的漏拍间隔（跨两拍、
+   约两倍时长）与插入拍间隔由此自动归一化，不会直接产生半速 / 倍速值；
+2. 用以每个间隔为中心的滑动**中位数**窗口求稳健 BPM；原始 BPM 超出
+   `[min_bpm, max_bpm]`，或相对局部中位数偏离超过 25%（半速 / 倍速残留）
+   的间隔判定为漏拍 / 插入拍造成的异常间隔，其**起始参考拍索引**记入
+   `ignored_ref_indices`；
+3. 把剩余间隔按稳健 BPM 压缩：相对差不超过 2% 的连续间隔合并为一个
+   tempo event；**被忽略的间隔不参与 BPM 计算，也不切断事件**，因此
+   异常两侧的同速区间会合并为同一事件。
+
+响应示例：
+
+```json
+{
+  "job_id": 7,
+  "parameters": {
+    "window_beats": 5, "min_bpm": 40.0, "max_bpm": 300.0,
+    "outlier_tolerance": 0.25, "stable_tolerance": 0.02
+  },
+  "matched_beat_count": 9,
+  "events": [
+    {"ref_start_index": 0, "ref_end_index": 4, "start_time": 0.0,
+     "ref_time": 0.0, "bpm": 120.0, "beat_count": 4, "gap_count": 4},
+    {"ref_start_index": 4, "ref_end_index": 8, "start_time": 2.0,
+     "ref_time": 2.0, "bpm": 100.0, "beat_count": 4, "gap_count": 4}
+  ],
+  "ignored_ref_indices": []
+}
+```
+
+- `events` 按**参考拍排序**，自 `ref_start_index`（事件起拍）起以 `bpm`
+  生效，到下一事件起拍前结束；`start_time` 为起拍对应的**演奏时间**，
+  `ref_time` 为参考网格时间。
+- `bpm` 为该稳定区间内稳健 BPM 的中位数；`beat_count` 为覆盖的参考拍数
+  （`ref_end_index − ref_start_index`，被忽略间隔跨过的漏拍也计入；
+  相邻事件共享边界拍，即前一事件结束拍 = 后一事件起拍）。
+- 所有间隔都异常时 `events` 为 `[]`、全部索引进 `ignored_ref_indices`。
+
+错误：任务不存在 `404`；任务尚未对齐 `409`；上次对齐失败 `400`；
+匹配拍不足 2 个 `409`；参数非法（越界或 `min_bpm >= max_bpm`）`422`。
+
+## 复核片段提取（`GET /jobs/{id}/review-segments`）
+
+对**已完成**的任务，按用户指定的**偏差阈值**与**可容忍的拍间隔**，把对齐
+结果中需要人工复核的三类问题按**参考拍顺序**聚合成复核片段，返回每个片段的
+**拍号范围**（1 基，便于对照乐谱 / DAW；同时给出 0 基参考索引）与**问题
+摘要**。该接口按需计算、只读，不修改 SQLite 中的对齐结果。
+
+查询参数：
+
+| 参数                    | 默认   | 说明                                                        |
+| ----------------------- | ------ | ----------------------------------------------------------- |
+| `deviation_threshold`   | `0.05` | 偏差阈值（秒）：匹配拍 `|偏差|` **严格大于**该值判为超阈值偏差（必须 > 0） |
+| `gap_tolerance_beats`   | `2.0`  | 可容忍的拍间隔：相邻问题的最近参考拍索引差 ≤ 该值时并入同一片段，否则另起（≥ 0，支持小数） |
+
+聚合规则：
+
+1. 三类问题统一为带“参考拍位置”的事件：
+   - **漏拍（missed）**：锚定在被漏的参考拍索引；
+   - **超阈值偏差（deviation）**：锚定在该匹配拍，按偏差符号标注抢拍 / 拖拍；
+   - **插入音（inserted）**：无对应参考拍，按其演奏时间在前后两个匹配拍之间
+     做线性内插，得到**分数参考位置**，片段跨度覆盖这两个匹配拍（位于所有
+     匹配拍之前 / 之后时退到最近的匹配拍）；
+2. 事件按参考拍位置排序，依次扫描：相邻事件的**最近边缘**参考拍索引差不超过
+   `gap_tolerance_beats` 时并入同一片段，否则另起一片段。例如两处问题分别在
+   第 2 拍与第 5 拍：差 3 拍，容差 2 时分裂为两个片段，容差 3 时合并；
+3. 每个片段输出：拍号 / 索引范围及两端参考时间、漏拍 / 插入音 / 超阈值偏差
+   （含抢 / 拖）计数、最大绝对偏差、逐问题明细 `issues`（含中文描述）与一段
+   中文 `summary`。没有问题时返回空片段列表（仍是 `200`）。
+
+响应示例（片段内含插入音、漏拍与连续拖拍）：
+
+```json
+{
+  "job_id": 7,
+  "parameters": {"deviation_threshold": 0.05, "gap_tolerance_beats": 2.0},
+  "segment_count": 1,
+  "total_missed_count": 1,
+  "total_inserted_count": 1,
+  "total_over_threshold_count": 3,
+  "segments": [
+    {
+      "segment_index": 0,
+      "ref_start_index": 1,
+      "ref_end_index": 5,
+      "beat_number_start": 2,
+      "beat_number_end": 6,
+      "ref_start_time": 0.5,
+      "ref_end_time": 2.5,
+      "missed_count": 1,
+      "inserted_count": 1,
+      "over_threshold_count": 3,
+      "early_count": 0,
+      "late_count": 3,
+      "issue_count": 5,
+      "max_abs_deviation": 0.06,
+      "summary": "漏拍 1 处，插入音 1 处，超阈值偏差 3 拍（拖拍 3），最大绝对偏差 0.060s；拍号范围 第 2–6 拍",
+      "issues": [
+        {"type": "inserted", "ref_index": null, "beat_number": null,
+         "perf_index": 3, "ref_time": null, "perf_time": 1.76,
+         "deviation": null, "status": null,
+         "description": "插入音：演奏音 #3（1.760s）位于参考第 3–4 拍之间，参考网格中无对应拍"},
+        {"type": "missed", "ref_index": 2, "beat_number": 3,
+         "perf_index": null, "ref_time": 1.0, "perf_time": null,
+         "deviation": null, "status": null,
+         "description": "漏拍：第 3 拍（参考时间 1.000s）未检测到对应的演奏音"},
+        {"type": "deviation", "ref_index": 3, "beat_number": 4,
+         "perf_index": 4, "ref_time": 1.5, "perf_time": 1.56,
+         "deviation": 0.06, "status": "late",
+         "description": "拖拍：第 4 拍偏差 +0.060s，超过阈值 ±0.050s"}
+      ]
+    }
+  ]
+}
+```
+
+- `beat_number_start` / `beat_number_end`：复核片段的 **1 基拍号范围**
+  （含端点），`ref_start_index` / `ref_end_index` 为对应的 0 基参考拍索引。
+  插入音没有单一拍号，其 `beat_number` 为 `null`，但会把所在区间扩展进片段范围。
+- 顶层 `total_*_count` 为全部片段的问题总数，便于在任务列表中快速统计。
+
+错误：任务不存在 `404`；任务尚未对齐或无对齐结果（`pending` / `result`
+缺失）返回 `409` 并提示先调用 `/jobs/{id}/align`；上次对齐失败 `400`；
+参数非法（阈值非正、可容忍间隔为负）`422`。
+
+## 跨任务合奏一致性（`POST /ensembles/consensus`）
+
+提交**至少 3 个已完成**任务 ID（每个任务对应一条演奏轨）与**秒级异常阈值**，
+对共享**完全相同的参考节拍网格**的多条演奏轨做合奏一致性分析。该接口按需
+计算、只读，不修改任何任务的对齐结果，也不落库。
+
+请求体：
+
+```json
+{
+  "job_ids": [1, 2, 3, 4],
+  "deviation_threshold": 0.05
+}
+```
+
+- `job_ids`：已完成（`status=done`）任务 ID 列表，**至少 3 个**、**不可重复**；
+  各任务的 `reference_beats` 必须**逐值完全相同**（长度与每个时间点都相等）。
+- `deviation_threshold`：秒级异常阈值（必须 > 0）。校正后的演奏时间相对合奏
+  基准的偏差 `|偏差|` **严格大于**该值才报异常。
+
+处理流程：
+
+1. **固定录音延迟校正**：每条轨以其匹配拍 `perf_time − ref_time` 的**中位数**
+   估计该轨的固定录音延迟（中位数不受个别抢 / 拖拍影响），并把演奏时间校正为
+   `corrected_time = perf_time − delay`。没有匹配拍的轨延迟为 `null`，不参与
+   任何拍的基准计算。
+2. **逐拍合奏基准**：按参考拍汇总各轨校正时间，仅当**至少 3 轨**匹配该拍时，
+   取校正时间的**中位数**为合奏基准（`consensus_time`）；偏离基准严格超过阈值
+   的轨列入 `outliers`，给出任务 ID、校正时间、带符号偏差（负=抢拍 `early`、
+   正=拖拍 `late`）。
+3. **覆盖不足**：匹配轨数不足 3 的拍 `decidable=false`，不返回合奏基准
+   （`consensus_time=null`），**不报异常**（`outliers=[]`）。每拍同时给出
+   `matched_job_ids` / `missing_job_ids`；各轨漏拍另在 `tracks[].missed_beats`
+   中**逐轨列出**（0 基索引、1 基拍号与参考时间）。
+
+响应示例（4 轨、第 3 拍仅 1 轨匹配不可判定；第 4 拍轨 4 拖拍 0.09s）：
+
+```json
+{
+  "parameters": {"deviation_threshold": 0.05, "min_tracks_per_beat": 3},
+  "job_ids": [1, 2, 3, 4],
+  "reference_beats": [0.0, 0.5, 1.0, 1.5, 2.0],
+  "reference_beat_count": 5,
+  "track_count": 4,
+  "tracks": [
+    {"job_id": 1, "name": "violin", "delay": 0.012,
+     "matched_beat_count": 5, "missed_beat_count": 0, "missed_beats": []},
+    {"job_id": 4, "name": "cello", "delay": -0.02,
+     "matched_beat_count": 4, "missed_beat_count": 1,
+     "missed_beats": [{"ref_index": 2, "beat_number": 3, "ref_time": 1.0}]}
+  ],
+  "beat_count": 5,
+  "decidable_beat_count": 4,
+  "undecidable_beat_count": 1,
+  "outlier_count": 1,
+  "beats": [
+    {"ref_index": 2, "beat_number": 3, "ref_time": 1.0,
+     "decidable": false, "matched_track_count": 1, "consensus_time": null,
+     "matched_job_ids": [1], "missing_job_ids": [2, 3, 4],
+     "outlier_count": 0, "outliers": []},
+    {"ref_index": 3, "beat_number": 4, "ref_time": 1.5,
+     "decidable": true, "matched_track_count": 4, "consensus_time": 1.498,
+     "matched_job_ids": [1, 2, 3, 4], "missing_job_ids": [],
+     "outlier_count": 1,
+     "outliers": [
+       {"job_id": 4, "corrected_time": 1.588,
+        "deviation": 0.09, "status": "late"}
+     ]}
+  ]
+}
+```
+
+- `tracks[].delay`：该轨固定录音延迟（秒，匹配拍偏差中位数）；无匹配拍为
+  `null`。校正时间 = 原始演奏时间 − 该延迟。
+- `beats[]` 按参考拍顺序排列；`decidable=false` 的拍**不会**出现异常项。
+- 顶层 `decidable_beat_count` / `undecidable_beat_count` / `outlier_count`
+  分别为可判定拍数、不可判定拍数与全部可判定拍上的异常总数。
+
+错误：
+
+- `400` 任务 ID 重复，或引用了上次对齐失败（`error`）的任务；
+- `404` 任一任务 ID 不存在；
+- `409` 引用了尚未对齐（`pending`）或无对齐结果（`result` 缺失）的任务；
+- `422` 任务数少于 3、阈值非正，或任务之间参考节拍网格不完全相同。
+
+调用示例：
+
+```bash
+curl -s -X POST http://localhost:8000/ensembles/consensus \
+  -H 'Content-Type: application/json' \
+  -d '{"job_ids": [1, 2, 3, 4], "deviation_threshold": 0.05}'
+```
+
+## 多轨剪辑方案（`POST /takes/comp-plan`）
+
+提交**至少 2 个已完成**任务 ID（每个任务对应一条已对齐录音）、**每小节拍数**
+与非负的**换轨代价**，在共享**完全相同的参考节拍网格**上按小节自动拼轨，
+生成剪辑方案。该接口按需计算、只读，不修改任何任务的对齐结果，也不落库。
+
+请求体：
+
+```json
+{
+  "job_ids": [1, 2],
+  "beats_per_bar": 4,
+  "switch_cost": 0.05
+}
+```
+
+- `job_ids`：已完成（`status=done`）任务 ID 列表，**至少 2 个**、**不可重复**；
+  各任务的 `reference_beats` 必须**逐值完全相同**（长度与每个时间点都相等），
+  任务顺序即请求顺序，用于同代价时的取舍。
+- `beats_per_bar`：每小节拍数（正整数）。参考拍自索引 0 起每该数划分为一个
+  小节；**末尾不足一小节的尾部拍仍作为一个（不完整）小节**参与选择。
+- `switch_cost`：相邻小节选用**不同**任务（换轨）的代价（≥ 0）。它与按秒计
+  的小节平均绝对偏差代价直接相加权衡：取 0 表示允许每小节自由换轨；值越大
+  越倾向于全程使用同一录音。
+
+处理流程：
+
+1. **划小节**：按 `beats_per_bar` 把共享参考拍切成连续小节（末尾小节可能
+   不足一拍组）。
+2. **小节可用性与选用代价**：某条录音只有**完整匹配该小节全部拍**时才可用于
+   该小节——小节内任一拍是漏拍（含插入拍导致的错位）即不可用；可用录音对
+   该小节的选用代价为小节各匹配拍 **|偏差| 的平均值**（平均绝对偏差，秒）。
+3. **动态规划**：以「各小节选用代价之和 + 相邻小节换轨代价之和」最小为目标
+   做逐小节 DP（时间复杂度 O(小节数 × 轨数²)）。在所有总代价最小的方案中，
+   取按**请求顺序**字典序最小的选轨序列：前向 DP 求出到达每个「小节 × 任务」
+   状态的最优代价，再从首小节起贪心，每小节取请求顺序最靠前、且已选前缀仍
+   能达成全局最优总代价的任务。
+4. **合并片段**：把选出的连续**同源小节**（相邻小节选用同一任务）合并为一个
+   片段返回；任一小节没有任何录音完整匹配其全部拍时，返回 `422` 并在
+   `detail` 中列出全部相关**小节序号（1 基）**。
+
+响应示例（2 条录音、每小节 3 拍、共 2 小节，零换轨代价各取所长）：
+
+```json
+{
+  "parameters": {"beats_per_bar": 3, "switch_cost": 0.0},
+  "job_ids": [1, 2],
+  "reference_beats": [0.0, 0.5, 1.0, 1.5, 2.0, 2.5],
+  "reference_beat_count": 6,
+  "beats_per_bar": 3,
+  "bar_count": 2,
+  "take_count": 2,
+  "switch_count": 1,
+  "total_cost": 0.02,
+  "segment_count": 2,
+  "segments": [
+    {
+      "segment_index": 0,
+      "job_id": 1,
+      "name": "take-a",
+      "bar_start": 1,
+      "bar_end": 1,
+      "bar_count": 1,
+      "ref_start_index": 0,
+      "ref_end_index": 2,
+      "beat_number_start": 1,
+      "beat_number_end": 3,
+      "beat_count": 3,
+      "ref_start_time": 0.0,
+      "ref_end_time": 1.0,
+      "source_start_time": 0.01,
+      "source_end_time": 1.01,
+      "source_start_perf_index": 0,
+      "source_end_perf_index": 2,
+      "mean_absolute_deviation": 0.01,
+      "selection_cost": 0.01
+    },
+    {
+      "segment_index": 1,
+      "job_id": 2,
+      "name": "take-b",
+      "bar_start": 2,
+      "bar_end": 2,
+      "bar_count": 1,
+      "ref_start_index": 3,
+      "ref_end_index": 5,
+      "beat_number_start": 4,
+      "beat_number_end": 6,
+      "beat_count": 3,
+      "ref_start_time": 1.5,
+      "ref_end_time": 2.5,
+      "source_start_time": 1.51,
+      "source_end_time": 2.51,
+      "source_start_perf_index": 3,
+      "source_end_perf_index": 5,
+      "mean_absolute_deviation": 0.01,
+      "selection_cost": 0.01
+    }
+  ]
+}
+```
+
+- 片段按**参考拍顺序**排列；连续同源小节已合并，`bar_count` / `beat_count`
+  为合并后的小节数与拍数，`bar_start` / `bar_end`、`beat_number_start` /
+  `beat_number_end` 为对应的 1 基小节序号 / 拍号范围（含端点），
+  `ref_start_index` / `ref_end_index` 为 0 基参考拍索引范围。
+- `source_start_time` / `source_end_time`：该片段**来源首末匹配音**的演奏
+  时间（秒），可直接用于在对应任务的录音上定位剪入 / 剪出点；
+  `source_start_perf_index` / `source_end_perf_index` 为其在该任务演奏序列
+  中的 0 基索引（漏拍会使索引与参考拍索引错位）。
+- `selection_cost` 为片段内各小节选用代价（平均绝对偏差）之和，
+  `mean_absolute_deviation` 为这些小节选用代价的小节平均值；顶层
+  `total_cost = 全部片段 selection_cost 之和 + switch_count × switch_cost`。
+- `switch_count` 为最优方案中相邻小节的换轨次数（片段数与换轨次数不必相等，
+  因为同一任务可能在间隔若干小节后再次被选中）。
+
+错误：
+
+- `400` 任务 ID 重复，或引用了上次对齐失败（`error`）的任务；
+- `404` 任一任务 ID 不存在；
+- `409` 引用了尚未对齐（`pending`）或无对齐结果（`result` 缺失）的任务；
+- `422` 任务数少于 2、`beats_per_bar` 非正、`switch_cost` 为负、任务之间
+  参考节拍网格不完全相同，或某小节没有任何录音完整匹配其全部拍
+  （`detail` 含 1 基小节序号，如“第 2、4 小节”）。
+
+调用示例：
+
+```bash
+curl -s -X POST http://localhost:8000/takes/comp-plan \
+  -H 'Content-Type: application/json' \
+  -d '{"job_ids": [1, 2], "beats_per_bar": 4, "switch_cost": 0.05}'
+```
+
+## 算法说明
+
+设参考拍 `r₀..rₙ₋₁`、演奏音 `p₀..pₘ₋₁`，代价矩阵单元
+`D(i,j)` 表示从起点对齐到“参考前 i 拍 / 演奏前 j 音”的最小代价：
+
+```
+                 ⎧ D(i−1,j−1) + (p[j−1] − r[i−1])²   匹配（对角）
+D(i,j) = min of  ⎨ D(i−1,j)   + skip_penalty          漏拍（水平）
+                 ⎩ D(i,j−1)   + insert_penalty         插入拍（垂直）
+```
+
+- 只在 Sakoe-Chiba 带 `|i − j| ≤ band_width` 内展开（端点固定为
+  `(0,0) → (n,m)`），时间复杂度约 O((n+m)·band_width)，空间 O(n·m)。
+- 匹配代价用**时间偏差平方**；漏 / 插代价为常数惩罚，因此只有在时间偏差
+  确实比“判为漏拍 + 相邻配对”更划算时才会选择漏 / 插，避免误配。
+- 代价同以“秒²”为单位；默认惩罚取 `(0.5 × 中位拍间隔)²`。
+- 回填时记录回溯指针（对角/水平/垂直），还原唯一最优路径；代价相同优先
+  取对角匹配，保证结果确定。
+- 2000 拍、带宽 13 的典型输入在普通笔记本上约 0.3s、50MB 内存。
+
+### 锚点硬约束下的分段 DTW
+
+提供 `anchors = [(r₁,p₁), …, (rₖ,pₖ)]` 时：
+
+1. 先校验锚点非负、不越界、两侧索引严格递增，且每个锚点满足
+   `|r−p| ≤ band_width`（在带内即保证与相邻锚点 / 端点之间存在合法路径）；
+2. 匹配 `ref[r] ↔ perf[p]` 的对角步落在 DP 网格单元 `(r+1, p+1)`，把这些
+   单元连同虚拟端点 `(0,0)`、`(n,m)` 作为分段边界；
+3. 每两个相邻边界之间独立运行上述带状 DTW；真实锚点单元**禁止水平 / 垂直
+   进入**（只能对角进入），因此锚点一定是一次匹配，构成硬约束；
+4. 各子段回溯出的单元路径按序拼接（段端点不重复），再统一还原
+   匹配 / 漏拍 / 插入拍事件——漏拍与插入拍可以出现在任意段内，
+   总代价为各段代价之和；
+5. 结果 `anchors` 字段从最终路径中提取，回传已采用锚点及其偏差与状态。
+
+## 状态码
+
+- `201` 任务创建成功；`200` 对齐 / 查询成功
+- `400` 带宽不足无法对齐（含 `|n−m| > band_width` 预检）、惩罚参数非法，
+  或锚点校验失败（索引为负 / 越界 / 非严格递增 / 超出带宽不可达），
+  `detail` 中会给出具体锚点与原因
+- `404` 任务不存在
+- `409` 对尚未对齐（`pending`）的任务调用 `/result`、`/tempo-map` 或
+  `/review-segments`；`/tempo-map` 的匹配拍不足 2 个；或任务无对齐结果
+  （`result` 缺失）时调用 `/review-segments`
+- `400` `/tempo-map` 或 `/review-segments` 作用于上次对齐失败（`error`）的任务
+- `422` 请求体校验失败（空序列、非递增、字段类型错误等），
+  或查询参数非法（`min_bpm >= max_bpm`、`window_beats` 越界、
+  `deviation_threshold ≤ 0`、`gap_tolerance_beats < 0`）；
+  合奏一致性任务数不足 3、阈值非正或参考节拍网格不一致同样返回 `422`
+- 合奏一致性（`POST /ensembles/consensus`）：任务 ID 重复或引用上次对齐
+  失败的任务返回 `400`；任务不存在 `404`；任务尚未对齐或无对齐结果
+  返回 `409`；成功为 `200`
+- 剪辑方案（`POST /takes/comp-plan`）：任务 ID 重复或引用上次对齐失败的
+  任务返回 `400`；任务不存在 `404`；任务尚未对齐或无对齐结果返回 `409`；
+  任务数不足 2、每小节拍数非正、换轨代价为负、参考节拍网格不一致，或某
+  小节无任何录音完整匹配其全部拍（含小节序号）返回 `422`；成功为 `200`
