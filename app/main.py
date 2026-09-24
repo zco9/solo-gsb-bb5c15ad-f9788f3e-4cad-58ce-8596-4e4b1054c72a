@@ -21,6 +21,7 @@ from .alignment import (
 from .comp_plan import CompPlanError, build_comp_plan
 from .database import get_db, init_db
 from .ensemble import EnsembleError, build_consensus
+from .phrases import PhraseError, find_occurrences
 from .review import ReviewError, extract_review_segments
 from .schemas import (
     CompPlanOut,
@@ -30,6 +31,8 @@ from .schemas import (
     JobCreate,
     JobOut,
     JobSummary,
+    PhraseOccurrencesOut,
+    PhraseOccurrencesRequest,
     ReviewSegmentsOut,
     TempoMapOut,
 )
@@ -44,7 +47,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="多轨录音节拍对齐 API",
-    version="1.5.0",
+    version="1.6.0",
     description=(
         "提交参考节拍网格与演奏轨音符起始时间，服务使用带宽约束的动态时间规整"
         "（Sakoe-Chiba DTW）处理漏拍、抢拍与插入拍，回溯生成一一对应映射及"
@@ -60,6 +63,12 @@ app = FastAPI(
         "动态规划拼轨：以完整匹配小节各拍的平均绝对偏差为选用代价、相邻小节"
         "换轨另付非负代价，总代价最小时优先请求顺序靠前的任务，返回合并连续"
         "同源小节的剪辑片段。"
+        "调用 /phrases/occurrences 可直接提交短乐句参考拍、较长录音起音、"
+        "候选速度倍率与容差：按倍率缩放参考拍并以首次匹配起音为基准计算误差，"
+        "在整段录音中搜索乐句出现（允许漏拍与多余起音，首末参考拍须匹配、"
+        "总匹配不少于三拍、各匹配拍误差不超过容差），对时间区间重叠的候选做"
+        "全局选择（先最大化互不重叠出现次数，再最小化总绝对误差），返回每次"
+        "出现的时间区间、倍率与参考拍到起音的索引映射。"
     ),
     lifespan=lifespan,
 )
@@ -470,3 +479,43 @@ def takes_comp_plan(
             detail=str(exc),
         )
     return plan
+
+
+@app.post(
+    "/phrases/occurrences",
+    response_model=PhraseOccurrencesOut,
+    status_code=status.HTTP_200_OK,
+    tags=["phrases"],
+)
+def phrase_occurrences(payload: PhraseOccurrencesRequest):
+    """在较长录音中按候选速度倍率搜索短乐句的出现（直接处理请求数据，不落库）。
+
+    提交**严格递增**的短乐句参考拍（≥2 拍）、较长录音的起音时间、候选速度
+    倍率（正数，实际拍间隔与参考拍间隔之比）与非负容差（秒）：
+
+    - 按倍率缩放参考拍，把参考首拍锚定在录音某起音上，**误差相对首次匹配
+      起音计算**（首拍误差恒为 0）；各匹配拍的缩放后时间误差不超过容差；
+    - 允许漏拍（中间参考拍不匹配）与多余起音（不参与匹配）；**首末参考拍
+      必须匹配、总匹配不少于 3 拍**；
+    - 同一（首起音、尾起音、倍率）组合只保留匹配拍数最多、总绝对误差最小
+      的映射；
+    - 时间区间重叠（含端点相接，即共用录音起音）的候选不可同时保留：全局
+      选择先最大化互不重叠的出现次数，再最小化总绝对误差，最后按所选起点
+      序列与倍率输入顺序打破并列。
+
+    返回每次出现的时间区间、倍率与参考拍 → 起音的索引映射；无命中时
+    ``occurrences`` 为空列表（仍是 200）。参数非法（序列非递增、倍率非正、
+    容差为负等）返回 422。
+    """
+    try:
+        return find_occurrences(
+            payload.reference_beats,
+            payload.recording_onsets,
+            payload.rates,
+            payload.tolerance,
+        )
+    except PhraseError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=str(exc),
+        )

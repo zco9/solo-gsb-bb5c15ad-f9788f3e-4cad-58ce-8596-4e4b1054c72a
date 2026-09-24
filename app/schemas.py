@@ -432,3 +432,76 @@ class CompPlanOut(BaseModel):
     segments: list[CompPlanSegment] = Field(
         ..., description="合并连续同源小节后的剪辑片段，按参考拍顺序排列"
     )
+
+
+# ---- 乐句出现检测 POST /phrases/occurrences ----
+
+
+class PhraseOccurrencesRequest(BaseModel):
+    reference_beats: list[float] = Field(
+        ..., min_length=2, description="短乐句参考拍时间（秒），需严格递增"
+    )
+    recording_onsets: list[float] = Field(
+        ..., min_length=1, description="较长录音的起音时间（秒），需严格递增"
+    )
+    rates: list[float] = Field(
+        ...,
+        min_length=1,
+        description=(
+            "候选速度倍率（正数）：实际拍间隔与参考拍间隔之比，"
+            "如 2.0 表示录音以半速演奏该乐句"
+        ),
+    )
+    tolerance: float = Field(
+        ..., ge=0, description="容差（秒，非负）：各匹配拍缩放后时间误差的上限"
+    )
+
+    @field_validator("reference_beats", "recording_onsets")
+    @classmethod
+    def _strictly_increasing(cls, v: list[float]) -> list[float]:
+        if any(v[i] <= v[i - 1] for i in range(1, len(v))):
+            raise ValueError("时间序列必须严格递增")
+        return v
+
+    @field_validator("rates")
+    @classmethod
+    def _positive_rates(cls, v: list[float]) -> list[float]:
+        if any(r <= 0 for r in v):
+            raise ValueError("候选速度倍率必须为正数")
+        return v
+
+
+class PhraseMatch(BaseModel):
+    ref_index: int = Field(..., description="参考拍 0 基索引")
+    onset_index: int = Field(..., description="录音起音 0 基索引")
+    error: float = Field(
+        ...,
+        description="缩放后时间误差（秒）：起音时间 − 相对首次匹配起音的预测时间",
+    )
+
+
+class PhraseOccurrence(BaseModel):
+    occurrence_index: int = Field(..., description="出现序号（按首起音时间升序）")
+    rate: float = Field(..., description="本次出现采用的速度倍率")
+    rate_index: int = Field(..., description="采用倍率在请求 rates 中的 0 基序号")
+    start_time: float = Field(..., description="出现区间起点：首匹配起音时间（秒）")
+    end_time: float = Field(..., description="出现区间终点：末匹配起音时间（秒）")
+    start_onset_index: int = Field(..., description="首匹配起音 0 基索引")
+    end_onset_index: int = Field(..., description="末匹配起音 0 基索引")
+    matched_count: int = Field(..., description="匹配拍数（≥3，含首末参考拍）")
+    total_absolute_error: float = Field(
+        ..., description="各匹配拍缩放后时间误差绝对值之和（秒）"
+    )
+    mapping: list[PhraseMatch] = Field(
+        ..., description="参考拍 → 录音起音的索引映射（含逐拍误差）"
+    )
+
+
+class PhraseOccurrencesOut(BaseModel):
+    parameters: dict[str, Any]
+    candidate_count: int = Field(..., description="进入全局选择的候选出现数")
+    occurrence_count: int = Field(..., description="全局选择后保留的出现数")
+    occurrences: list[PhraseOccurrence] = Field(
+        default_factory=list,
+        description="按首起音时间升序的出现列表；无命中时为空",
+    )
