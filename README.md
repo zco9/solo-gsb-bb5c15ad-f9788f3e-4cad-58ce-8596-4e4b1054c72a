@@ -31,6 +31,14 @@ plan）**：按参考拍划小节，只有完整匹配某小节全部拍的录�
 相邻小节换轨代价之和，同代价时优先请求顺序靠前的任务，返回合并连续同源
 小节后的剪辑片段。
 
+此外还可以直接在较长录音中搜索**短乐句出现（phrase occurrences）**：提交
+短乐句的参考拍、录音的起音时间、候选速度倍率（实际拍间隔 / 参考拍间隔）与
+秒级容差，服务按倍率在整段录音中定位乐句出现——允许漏拍与多余起音，但
+首尾参考拍必须匹配、总匹配不少于三拍，各匹配拍误差相对首次匹配起音计算
+且不超过容差；对时间区间重叠的候选做全局选择（先最大化互不重叠的出现
+次数，再最小化总绝对误差），返回每次出现的时间区间、倍率与参考拍到起音
+的索引映射。该接口直接处理请求数据，不创建或修改任何任务。
+
 ## 目录结构
 
 ```
@@ -42,12 +50,13 @@ plan）**：按参考拍划小节，只有完整匹配某小节全部拍的录�
 │   ├── review.py        # 复核片段提取：漏拍/插入音/超阈值偏差按参考拍聚合
 │   ├── ensemble.py      # 跨任务合奏一致性：逐轨延迟校正 + 逐拍中位数基准
 │   ├── comp_plan.py     # 剪辑方案：按小节平均绝对偏差 + 换轨代价的动态规划拼轨
+│   ├── phrase.py        # 乐句出现搜索：按候选倍率缩放匹配 + 重叠候选全局选择
 │   ├── schemas.py       # Pydantic 请求/响应模型
 │   ├── database.py      # SQLite 连接、建表与旧库迁移
 │   └── crud.py          # 任务读写
 ├── tests/               # unittest 测试（对齐算法 18 个 + 节奏曲线 10 个
 │                        #   + 复核片段 14 个 + 合奏一致性 10 个
-│                        #   + 剪辑方案 13 个 + 接口 38 个）
+│                        #   + 剪辑方案 13 个 + 乐句出现 25 个 + 接口 44 个）
 ├── Dockerfile
 ├── docker-compose.yml
 └── requirements.txt
@@ -71,6 +80,9 @@ docker compose up --build
 - 剪辑方案接口示例：
   `POST http://localhost:8000/takes/comp-plan`
   （请求体 `{"job_ids": [1, 2], "beats_per_bar": 4, "switch_cost": 0.05}`）
+- 乐句出现搜索接口示例：
+  `POST http://localhost:8000/phrases/occurrences`
+  （请求体 `{"reference_beats": [0.0, 0.5, 1.0, 1.5], "performance_onsets": [0.3, 2.0, 2.5, 3.0, 3.5, 9.9], "ratios": [1.0, 2.0], "tolerance": 0.05}`）
 - SQLite 数据文件：容器内 `/data/alignment.db`，由命名卷 `beat-data` 持久化
 
 配置（均通过环境变量，见 `docker-compose.yml`）：
@@ -117,6 +129,7 @@ PYTHONPATH=. python -m unittest discover -s tests -v
 | GET    | `/jobs/{id}/review-segments` | 提取复核片段：漏拍/插入音/超阈值偏差按参考拍聚合（拍号范围 + 摘要） |
 | POST   | `/ensembles/consensus`     | 跨任务合奏一致性：逐轨固定延迟校正后按参考拍取中位数基准，列出超阈值异常任务 |
 | POST   | `/takes/comp-plan`         | 多轨剪辑方案：按小节平均绝对偏差 + 换轨代价动态规划拼轨，合并连续同源小节 |
+| POST   | `/phrases/occurrences`     | 乐句出现搜索：按候选倍率在录音起音中定位短乐句，重叠候选全局选择（不落库） |
 | GET    | `/jobs`                    | 任务列表（摘要，按创建时间倒序）       |
 | GET    | `/health`                  | 健康检查                               |
 
@@ -205,7 +218,17 @@ curl -s -X POST http://localhost:8000/takes/comp-plan \
   -H 'Content-Type: application/json' \
   -d '{"job_ids": [1, 2], "beats_per_bar": 3, "switch_cost": 0.05}'
 
-# 8) 列出全部任务
+# 8) 乐句出现搜索（直接提交参考拍与录音起音，不依赖任务）
+curl -s -X POST http://localhost:8000/phrases/occurrences \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "reference_beats": [0.0, 0.5, 1.0, 1.5],
+    "performance_onsets": [0.3, 2.0, 2.5, 3.0, 3.5, 9.9],
+    "ratios": [1.0, 2.0],
+    "tolerance": 0.05
+  }'
+
+# 9) 列出全部任务
 curl -s http://localhost:8000/jobs
 ```
 
@@ -652,6 +675,100 @@ curl -s -X POST http://localhost:8000/takes/comp-plan \
   -d '{"job_ids": [1, 2], "beats_per_bar": 4, "switch_cost": 0.05}'
 ```
 
+## 乐句出现搜索（`POST /phrases/occurrences`）
+
+提交短乐句的**参考拍**、较长录音的**起音时间**、候选**速度倍率**与秒级
+**容差**，在整段录音中按倍率搜索乐句的出现位置。该接口**直接处理请求
+数据**：按需计算、只读，不创建或修改任何任务，也不落库。
+
+请求体：
+
+```json
+{
+  "reference_beats": [0.0, 0.5, 1.0, 1.5],
+  "performance_onsets": [0.3, 2.0, 2.5, 3.0, 3.5, 9.9],
+  "ratios": [1.0, 2.0],
+  "tolerance": 0.05
+}
+```
+
+- `reference_beats`：短乐句的参考拍时间（秒），**严格递增**。
+- `performance_onsets`：较长录音的起音时间（秒），**严格递增**。
+- `ratios`：候选速度倍率（**正数**，至少 1 个），表示**实际拍间隔与参考
+  拍间隔之比**——如 `2.0` 表示实际演奏慢一倍（拍间隔翻倍）。输入顺序
+  即并列打破时的优先顺序。
+- `tolerance`：容差（秒，**非负**）。各匹配拍的缩放后时间误差不超过
+  该值才可匹配。
+
+匹配规则：
+
+1. **缩放与误差**：若参考首拍匹配到起音 `p`，则参考第 i 拍的期望时间为
+   `p + ratio × (ref[i] − ref[0])`——误差一律**相对首次匹配起音**计算，
+   即 `误差 = 起音时间 − 期望时间`，`|误差| ≤ tolerance` 的起音才可匹配
+   该拍（容差边界含等号）。
+2. **候选生成**：对每个倍率（按输入顺序）与每个可能的首拍起音，在录音中
+   寻找落在期望区间终点 ± 容差内的尾拍起音，构成候选的首尾配对。
+3. **候选内最优映射**：固定首尾后，中间参考拍与中间起音做单调子序列匹配，
+   **允许漏拍**（参考拍不匹配）与**多余起音**（起音不使用）；但**首尾参考
+   拍必须匹配**、**总匹配不少于 3 拍**。同一首尾和倍率的候选取**匹配拍数
+   最多**、再取**总绝对误差最小**的映射。
+4. **全局选择**：候选的时间区间为 `[首匹配起音时间, 尾匹配起音时间]`，
+   区间重叠的候选不可兼得（**端点相接不算重叠**，允许前一出现的尾音同时
+   是后一出现的首音）。按字典序目标做全局选择：先**最大化互不重叠的出现
+   次数**，再**最小化总绝对误差**（各出现误差之和），再按**所选起点序列**
+   （越早越优先）与**倍率输入顺序**（下标小者优先）打破并列。
+
+响应示例（上例请求在倍率 1.0 下命中一次）：
+
+```json
+{
+  "parameters": {"tolerance": 0.05, "ratios": [1.0, 2.0], "min_matched_beats": 3},
+  "reference_beat_count": 4,
+  "onset_count": 6,
+  "candidate_count": 1,
+  "occurrence_count": 1,
+  "occurrences": [
+    {
+      "occurrence_index": 0,
+      "ratio": 1.0,
+      "ratio_index": 0,
+      "start_time": 2.0,
+      "end_time": 3.5,
+      "start_onset_index": 1,
+      "end_onset_index": 4,
+      "matched_count": 4,
+      "total_abs_error": 0.0,
+      "mapping": [
+        {"ref_index": 0, "onset_index": 1, "ref_time": 0.0, "onset_time": 2.0, "error": 0.0},
+        {"ref_index": 1, "onset_index": 2, "ref_time": 0.5, "onset_time": 2.5, "error": 0.0},
+        {"ref_index": 2, "onset_index": 3, "ref_time": 1.0, "onset_time": 3.0, "error": 0.0},
+        {"ref_index": 3, "onset_index": 4, "ref_time": 1.5, "onset_time": 3.5, "error": 0.0}
+      ]
+    }
+  ]
+}
+```
+
+- `occurrences` 按**起点时间**排序；`start_time` / `end_time` 为该出现的
+  时间区间（首 / 尾匹配起音时间），`mapping` 为**参考拍到起音的索引映射**
+  （含两侧时间与逐拍误差）。
+- `candidate_count` 为全局选择前满足条件的候选数，`occurrence_count` 为
+  最终返回的出现数；**无命中时 `occurrences` 为空列表**（仍是 `200`）。
+- 参考拍或起音不足 3 个时不可能满足“总匹配不少于三拍”，返回空列表。
+
+错误：请求体非法（时间序列非严格递增、倍率非正、容差为负、序列为空等）
+返回 `422`。
+
+调用示例：
+
+```bash
+curl -s -X POST http://localhost:8000/phrases/occurrences \
+  -H 'Content-Type: application/json' \
+  -d '{"reference_beats": [0.0, 0.5, 1.0, 1.5],
+       "performance_onsets": [0.3, 2.0, 2.5, 3.0, 3.5, 9.9],
+       "ratios": [1.0, 2.0], "tolerance": 0.05}'
+```
+
 ## 算法说明
 
 设参考拍 `r₀..rₙ₋₁`、演奏音 `p₀..pₘ₋₁`，代价矩阵单元
@@ -709,3 +826,6 @@ D(i,j) = min of  ⎨ D(i−1,j)   + skip_penalty          漏拍（水平）
   任务返回 `400`；任务不存在 `404`；任务尚未对齐或无对齐结果返回 `409`；
   任务数不足 2、每小节拍数非正、换轨代价为负、参考节拍网格不一致，或某
   小节无任何录音完整匹配其全部拍（含小节序号）返回 `422`；成功为 `200`
+- 乐句出现搜索（`POST /phrases/occurrences`）：请求体非法（时间序列非
+  严格递增、倍率非正、容差为负、序列为空等）返回 `422`；成功为 `200`
+  （无命中时 `occurrences` 为空列表）

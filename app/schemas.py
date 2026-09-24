@@ -432,3 +432,91 @@ class CompPlanOut(BaseModel):
     segments: list[CompPlanSegment] = Field(
         ..., description="合并连续同源小节后的剪辑片段，按参考拍顺序排列"
     )
+
+
+# ---- 乐句出现搜索 POST /phrases/occurrences ----
+
+
+class PhraseOccurrenceRequest(BaseModel):
+    reference_beats: list[float] = Field(
+        ..., min_length=1,
+        description="短乐句的参考拍时间（秒），需严格递增",
+    )
+    performance_onsets: list[float] = Field(
+        ..., min_length=1,
+        description="较长录音的起音时间（秒），需严格递增",
+    )
+    ratios: list[float] = Field(
+        ...,
+        min_length=1,
+        description=(
+            "候选速度倍率（正数）：实际拍间隔与参考拍间隔之比，"
+            "如 2.0 表示实际速度慢一倍；输入顺序用于并列打破"
+        ),
+    )
+    tolerance: float = Field(
+        ..., ge=0,
+        description=(
+            "容差（秒，非负）：各匹配拍误差相对首次匹配起音计算，"
+            "|误差| 不超过该值才可匹配"
+        ),
+    )
+
+    @field_validator("reference_beats", "performance_onsets")
+    @classmethod
+    def _strictly_increasing(cls, v: list[float]) -> list[float]:
+        if any(v[i] <= v[i - 1] for i in range(1, len(v))):
+            raise ValueError("时间序列必须严格递增")
+        return v
+
+    @field_validator("ratios")
+    @classmethod
+    def _positive_ratios(cls, v: list[float]) -> list[float]:
+        if any(k <= 0 for k in v):
+            raise ValueError("候选倍率必须全部为正数")
+        return v
+
+
+class PhraseMatch(BaseModel):
+    ref_index: int = Field(..., description="参考拍 0 基索引")
+    onset_index: int = Field(..., description="起音 0 基索引")
+    ref_time: float = Field(..., description="参考拍时间（秒）")
+    onset_time: float = Field(..., description="起音时间（秒）")
+    error: float = Field(
+        ...,
+        description=(
+            "缩放后时间误差（秒）：起音时间 −（首次匹配起音时间 "
+            "+ 倍率 ×（参考拍时间 − 参考首拍时间））"
+        ),
+    )
+
+
+class PhraseOccurrence(BaseModel):
+    occurrence_index: int = Field(..., description="出现序号（按起点时间排序，0 基）")
+    ratio: float = Field(..., description="本次出现采用的速度倍率")
+    ratio_index: int = Field(..., description="该倍率在请求 ratios 中的 0 基下标")
+    start_time: float = Field(..., description="出现区间起点：首匹配起音时间（秒）")
+    end_time: float = Field(..., description="出现区间终点：尾匹配起音时间（秒）")
+    start_onset_index: int = Field(..., description="首匹配起音的 0 基索引")
+    end_onset_index: int = Field(..., description="尾匹配起音的 0 基索引")
+    matched_count: int = Field(..., description="本次出现的匹配拍数（≥3，含首尾）")
+    total_abs_error: float = Field(
+        ..., description="本次出现各匹配拍 |误差| 之和（秒）"
+    )
+    mapping: list[PhraseMatch] = Field(
+        ..., description="参考拍到起音的索引映射（含首尾，按参考拍顺序）"
+    )
+
+
+class PhraseOccurrencesOut(BaseModel):
+    parameters: dict[str, Any]
+    reference_beat_count: int = Field(..., description="乐句参考拍数")
+    onset_count: int = Field(..., description="录音起音数")
+    candidate_count: int = Field(
+        ..., description="全局选择前满足条件的候选出现数"
+    )
+    occurrence_count: int = Field(..., description="全局选择后返回的出现数")
+    occurrences: list[PhraseOccurrence] = Field(
+        default_factory=list,
+        description="互不重叠的乐句出现（按起点时间排序）；无命中时为空列表",
+    )

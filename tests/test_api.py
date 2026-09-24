@@ -1130,5 +1130,122 @@ class TestAPI(unittest.TestCase):
         self.assertIn("参考节拍网格", r.json()["detail"])
 
 
+class TestPhraseOccurrencesAPI(unittest.TestCase):
+    """POST /phrases/occurrences 接口集成测试（直接处理请求数据，不落库）。"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls._cm = TestClient(app)
+        cls.client = cls._cm.__enter__()
+        cls.addClassCleanup(cls._cm.__exit__, None, None, None)
+
+    PHRASE = [0.0, 0.5, 1.0, 1.5]
+
+    def _post(self, **overrides):
+        payload = {
+            "reference_beats": self.PHRASE,
+            "performance_onsets": [0.3, 2.0, 2.5, 3.0, 3.5, 9.9],
+            "ratios": [1.0],
+            "tolerance": 0.05,
+        }
+        payload.update(overrides)
+        return self.client.post("/phrases/occurrences", json=payload)
+
+    def test_basic_occurrence_found(self):
+        r = self._post()
+        self.assertEqual(r.status_code, 200, r.text)
+        out = r.json()
+        self.assertEqual(out["reference_beat_count"], 4)
+        self.assertEqual(out["onset_count"], 6)
+        self.assertEqual(out["occurrence_count"], 1)
+        self.assertEqual(out["parameters"]["min_matched_beats"], 3)
+        occ = out["occurrences"][0]
+        self.assertEqual(occ["occurrence_index"], 0)
+        self.assertEqual(occ["ratio"], 1.0)
+        self.assertEqual(occ["ratio_index"], 0)
+        self.assertEqual(occ["start_time"], 2.0)
+        self.assertEqual(occ["end_time"], 3.5)
+        self.assertEqual(occ["matched_count"], 4)
+        self.assertEqual(occ["total_abs_error"], 0.0)
+        self.assertEqual(
+            [(m["ref_index"], m["onset_index"]) for m in occ["mapping"]],
+            [(0, 1), (1, 2), (2, 3), (3, 4)],
+        )
+        for m in occ["mapping"]:
+            self.assertIn("ref_time", m)
+            self.assertIn("onset_time", m)
+            self.assertIn("error", m)
+
+    def test_scaled_ratio_and_missed_beat(self):
+        # 倍率 2.0 且漏了参考第 2 拍：3 拍匹配仍构成出现
+        r = self._post(
+            performance_onsets=[1.0, 2.0, 4.0],
+            ratios=[2.0],
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        occ = r.json()["occurrences"][0]
+        self.assertEqual(occ["ratio"], 2.0)
+        self.assertEqual(occ["matched_count"], 3)
+        self.assertEqual(
+            [m["ref_index"] for m in occ["mapping"]], [0, 1, 3]
+        )
+
+    def test_no_hit_returns_empty_list(self):
+        r = self._post(performance_onsets=[10.0, 10.1, 10.2, 10.3])
+        self.assertEqual(r.status_code, 200, r.text)
+        out = r.json()
+        self.assertEqual(out["occurrence_count"], 0)
+        self.assertEqual(out["occurrences"], [])
+
+    def test_short_phrase_returns_empty_not_error(self):
+        # 参考拍不足 3 个：合法输入，但不可能满足总匹配 >= 3
+        r = self._post(reference_beats=[0.0, 0.5])
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()["occurrences"], [])
+
+    def test_validation_errors_422(self):
+        # 参考拍非严格递增
+        r = self._post(reference_beats=[0.0, 0.0, 1.0])
+        self.assertEqual(r.status_code, 422)
+        # 起音非严格递增
+        r = self._post(performance_onsets=[0.0, 0.5, 0.5, 1.0])
+        self.assertEqual(r.status_code, 422)
+        # 倍率非正
+        r = self._post(ratios=[0.0])
+        self.assertEqual(r.status_code, 422)
+        r = self._post(ratios=[1.0, -2.0])
+        self.assertEqual(r.status_code, 422)
+        # 容差为负
+        r = self._post(tolerance=-0.01)
+        self.assertEqual(r.status_code, 422)
+        # 空序列
+        r = self._post(reference_beats=[])
+        self.assertEqual(r.status_code, 422)
+        r = self._post(performance_onsets=[])
+        self.assertEqual(r.status_code, 422)
+        r = self._post(ratios=[])
+        self.assertEqual(r.status_code, 422)
+
+    def test_does_not_touch_jobs(self):
+        # 接口直接处理请求数据：不创建任务，也不影响已有任务状态
+        before = self.client.get("/jobs").json()
+        r = self.client.post("/jobs", json={
+            "name": "phrase-side-effect-check",
+            "reference_beats": [0.0, 0.5, 1.0],
+            "performance_onsets": [0.0, 0.5, 1.0],
+        })
+        self.assertEqual(r.status_code, 201, r.text)
+        job_id = r.json()["id"]
+
+        r = self._post()
+        self.assertEqual(r.status_code, 200, r.text)
+
+        after = self.client.get("/jobs").json()
+        self.assertEqual(len(after), len(before) + 1)
+        job = self.client.get(f"/jobs/{job_id}").json()
+        self.assertEqual(job["status"], "pending")
+        self.assertIsNone(job["result"])
+
+
 if __name__ == "__main__":
     unittest.main()
